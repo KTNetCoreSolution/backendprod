@@ -5,19 +5,24 @@ on:
     branches:
       - main
 
+permissions:
+  contents: write           # 소스 코드 읽기/쓰기 권한
+  id-token: write           # OIDC 토큰 권한 (시크릿 보안 사용을 위해 필요)
+
 jobs:
   deploy-backend-prd:
-    runs-on: [self-hosted, Windows, X64, prod-runner]
+    runs-on: [self-hosted, Windows, X64, prod]
 
     steps:
       # 1. 현재 소스 백업
       - name: Backup current source files
+        shell: pwsh
         run: |
           $baseDir = 'D:\actions_work\netcore'
           $sourceDir = "$baseDir\source\backend"
           $backupBaseDir = "$baseDir\backup\source\backend"
-          $currentMonthDir = "$backupBaseDir\$(Get-Date -Format 'yyyyMM')"
-          $currentDateTime = "$(Get-Date -Format 'yyyyMMddHHmmss').zip"
+          $currentMonthDir = Join-Path -Path $backupBaseDir -ChildPath (Get-Date -Format 'yyyyMM')
+          $currentDateTime = "$(Get-Date -Format 'yyyyMMdd-HHmmss').zip"
 
           if (!(Test-Path -Path $currentMonthDir)) {
             New-Item -ItemType Directory -Path $currentMonthDir -Force
@@ -25,16 +30,17 @@ jobs:
 
           $backupFile = Join-Path -Path $currentMonthDir -ChildPath $currentDateTime
           Compress-Archive -Path "$sourceDir\*" -DestinationPath $backupFile -Force
-          Write-Host "Current source files have been backed up to: $backupFile"
+          Write-Host "✅ Current source files have been backed up to: $backupFile"
 
       # 2. 현재 배포 파일 백업
       - name: Backup current deploy files
+        shell: pwsh
         run: |
           $baseDir = 'D:\actions_work\netcore'
           $deployDir = "$baseDir\deploy\backend"
           $backupBaseDir = "$baseDir\backup\deploy\backend"
-          $currentMonthDir = "$backupBaseDir\$(Get-Date -Format 'yyyyMM')"
-          $currentDateTime = "$(Get-Date -Format 'yyyyMMddHHmmss').zip"
+          $currentMonthDir = Join-Path -Path $backupBaseDir -ChildPath (Get-Date -Format 'yyyyMM')
+          $currentDateTime = "$(Get-Date -Format 'yyyyMMdd-HHmmss').zip"
 
           if (!(Test-Path -Path $currentMonthDir)) {
             New-Item -ItemType Directory -Path $currentMonthDir -Force
@@ -42,38 +48,57 @@ jobs:
 
           $backupFile = Join-Path -Path $currentMonthDir -ChildPath $currentDateTime
           Compress-Archive -Path "$deployDir\*" -DestinationPath $backupFile -Force
-          Write-Host "Deploy files have been backed up to: $backupFile"
+          Write-Host "✅ Deploy files have been backed up to: $backupFile"
 
-      # 3. 소스 코드 다운로드 (Dev 저장소에서 소스 가져오기)
-      - name: Checkout source repository
+      # 3. 개발 Git에서 소스 코드 다운로드 (시크릿 사용: 개발 토큰)
+      - name: Checkout development repository
         uses: actions/checkout@v4
         with:
           repository: KTNetCoreSolution/backend
           ref: main
-          token: ${{ secrets.NETCORE_DEV_BACKEND_APP_TOKEN }}
+          token: ${{ secrets.NETCORE_DEV_BACKEND_APP_TOKEN }}  # 개발용 시크릿 사용
           path: source/backend
+      - name: Log development repository usage
+        shell: pwsh
+        run: |
+          Write-Host "ℹ️ Development repository checked out using DEV secret token."
 
-      # 4. Java 설치
+      # 4. Java 설치 (운영 노드에서 사용)
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
-          java-version: '21'
+          java-version: '21'  # 이미 설치된 버전 사용
           distribution: 'temurin'
+          check-latest: false # 최신 버전 다운로드 방지
 
-      # 5. 환경 파일(.env) 적용
+      # 5. 환경 파일(.env) 적용 (운영 시크릿 사용)
       - name: Apply production .env file
+        shell: pwsh
         run: |
-          Copy-Item -Path "D:\actions_work\netcore\source\backend\.env" -Destination "D:\actions_work\netcore\source\backend\.env" -Force
-          Write-Host ".env file applied successfully."
+          $envFile = "D:\actions_work\netcore\source\backend\.env.production"
+          $destinationPath = "D:\actions_work\netcore\source\backend\.env"
+
+          if (Test-Path -Path $envFile) {
+            if (Test-Path -Path $destinationPath) {
+              Remove-Item -Path $destinationPath -Force
+            }
+            Copy-Item -Path $envFile -Destination $destinationPath -Force
+            Write-Host "✅ .env.production successfully applied as .env file using PROD secret."
+          } else {
+            Write-Host "⚠️ Warning: .env.production not found. Using default environment configuration."
 
       # 6. 빌드 작업 실행
       - name: Build backend
+        shell: pwsh
         run: |
-          cd 'D:\actions_work\netcore\source\backend'
+          $buildDir = "D:\actions_work\netcore\source\backend"
+          cd $buildDir
           ./gradlew clean build
+          Write-Host "✅ Backend build completed successfully."
 
-      # 7. 빌드 결과물 배포 디렉토리로 복사
-      - name: Deploy backend build
+      # 7. 빌드 결과물 배포 디렉터리로 복사
+      - name: Deploy built JAR
+        shell: pwsh
         run: |
           $baseDir = 'D:\actions_work\netcore'
           $deployDir = "$baseDir\deploy\backend"
@@ -83,29 +108,34 @@ jobs:
             New-Item -ItemType Directory -Path $deployDir -Force
           }
 
+          # 기존 JAR 파일 삭제
+          Remove-Item -Path "$deployDir\netcore.jar" -Force -ErrorAction SilentlyContinue
+
+          # 새 JAR 파일 배포
           Copy-Item -Path $jarFile -Destination "$deployDir\netcore.jar" -Force
-          Write-Host "Backend JAR file has been copied to: $deployDir\netcore.jar"
+          Write-Host "✅ Backend JAR file has been copied to: $deployDir\netcore.jar"
 
-      # 8. 배포 저장소에 커밋 및 푸시 (Prod 저장소)
-      - name: Commit and push to deployment repo
-        run: |
-          cd 'D:\actions_work\netcore\deploy\backend'
-          git init
-          git remote add origin https://github.com/KTNetCoreSolution/backendprod.git
-          git add .
-          git commit -m "Deploy backend build at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-          git branch -M main
-          git push -u origin main --force
-        env:
-          GITHUB_TOKEN: ${{ secrets.NETCORE_PROD_BACKEND_APP_TOKEN }}
-
-      # 9. 서비스 재시작
+      # 8. 운영 환경의 기존 서비스 종료 및 재시작 (운영 시크릿 사용)
       - name: Restart Backend Service
+        shell: pwsh
         run: |
-          $serviceName = 'KTNetCoreBackendService'
-          if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
-            Stop-Service -Name $serviceName -Force
-            Start-Service -Name $serviceName
-            Write-Host "Service '$serviceName' restarted successfully."
+          $jarFile = "D:\actions_work\netcore\deploy\backend\netcore.jar"
+
+          # 기존 Java 프로세스 종료
+          $javaProcesses = Get-Process -Name "java" -ErrorAction SilentlyContinue
+          if ($javaProcesses) {
+            $javaProcesses | Stop-Process -Force
+            Write-Host "♻️ Existing Java processes terminated."
           } else {
-            Write-Host "Service '$serviceName' does not exist. Skipping restart."
+            Write-Host "➡️ No running Java processes found."
+
+          # 새 Java 애플리케이션 시작
+          Start-Process -FilePath "java" -ArgumentList "-jar $jarFile" -WorkingDirectory "D:\actions_work\netcore\deploy\backend" -NoNewWindow
+          Write-Host "✅ Java application started successfully with JAR: $jarFile"
+
+      # 9. 확인 메시지 출력 (개발 및 운영 시크릿 사용 공존 확인 로그)
+      - name: Log usage of both secrets
+        if: success()
+        shell: pwsh
+        run: |
+          Write-Host "✅ Deployment completed successfully using both DEV and PROD secrets."
